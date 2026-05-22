@@ -35,6 +35,25 @@ function getRouteForRole(role: Role): string {
   }
 }
 
+function getLoginErrorMessage(reason?: string): string {
+  switch (reason) {
+    case "SUSPENDED":
+      return "This account is suspended. Contact a Super Admin.";
+    case "LOCKED":
+      return "This account is locked after multiple failed attempts.";
+    case "ARCHIVED":
+      return "This account has been archived.";
+    case "DISABLED":
+      return "This account is disabled.";
+    case "PENDING":
+      return "This account is pending activation.";
+    case "PASSWORD_CHANGE_REQUIRED":
+      return "Password change is required before login.";
+    default:
+      return "Invalid username or password";
+  }
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const login = useAppStore((s) => s.login);
@@ -48,14 +67,14 @@ export default function LoginPage() {
     setError("");
 
     setTimeout(() => {
-      const loggedInUser = login(user, pass);
-      if (loggedInUser) {
-        toast.success(`Welcome back, ${loggedInUser.name}`, {
-          description: `Logged in as ${loggedInUser.role.replace("_", " ")}`,
+      const result = login(user, pass);
+      if (result.user) {
+        toast.success(`Welcome back, ${result.user.name}`, {
+          description: `Logged in as ${result.user.role.replace("_", " ")}`,
         });
-        router.push(getRouteForRole(loggedInUser.role));
+        router.push(getRouteForRole(result.user.role));
       } else {
-        setError("Invalid username or password");
+        setError(getLoginErrorMessage(result.reason));
         setIsLoading(false);
       }
     }, 300);

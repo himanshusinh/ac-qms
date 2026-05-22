@@ -25,8 +25,8 @@ export function KPICard({
   return (
     <div
       className={cn(
-        "relative rounded-xl border bg-white p-5 transition-all",
-        onClick && "cursor-pointer hover:shadow-md hover:border-brand-accent/40",
+        "relative rounded-lg bg-[var(--bg-card)] p-[var(--space-standard)] transition-all shadow-sm",
+        onClick && "cursor-pointer hover:shadow-md",
         highlight && "ring-2 ring-brand-highlight/30",
         className
       )}
@@ -37,7 +37,7 @@ export function KPICard({
           <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
             {title}
           </p>
-          <p className="text-3xl font-bold" style={{ color }}>
+          <p className="font-bold" style={{ color, fontSize: "var(--type-metric-size)" }}>
             {value}
           </p>
           {subtitle && (

@@ -7,7 +7,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   User, Batch, BatchDocument, AwsTestSection, AuditLog,
-  DocStatus, DocType, ActionType, DocumentType, Role,
+  DocStatus, DocType, ActionType, DocumentType, Role, UserStatus,
   CoaResult, WorkflowEntry, CoaSignature,
 } from '@/types';
 import {
@@ -16,6 +16,80 @@ import {
   SEED_BATCHES, SEED_BATCH_DOCUMENTS, SEED_AWS_SECTIONS,
 } from './mockData';
 import { generateId, now, generateDocNo } from './utils';
+import {
+  DEFAULT_PASSWORD,
+  buildUserAuditRef,
+  canManageTargetUser,
+  generateTemporaryPassword,
+  getUserPassword,
+  hasPermission,
+  isPrivilegedStatus,
+  normalizeUser,
+  resetUserPassword,
+} from './adminSecurity';
+
+const FAILED_LOGIN_LIMIT = 5;
+
+type LoginResult =
+  | { user: User; reason?: never }
+  | { user: null; reason: 'INVALID' | 'SUSPENDED' | 'LOCKED' | 'ARCHIVED' | 'DISABLED' | 'PENDING' | 'PASSWORD_CHANGE_REQUIRED' };
+
+type UserPatch = Partial<Pick<
+  User,
+  | 'name'
+  | 'username'
+  | 'email'
+  | 'phone'
+  | 'employeeId'
+  | 'role'
+  | 'department'
+  | 'status'
+  | 'lastLogin'
+  | 'password'
+  | 'forcePasswordChange'
+  | 'statusReason'
+  | 'suspendedReason'
+>> & {
+  lastActivityAt?: string | null;
+  passwordUpdatedAt?: string | null;
+  failedLoginAttempts?: number;
+  lockedAt?: string | null;
+  suspendedAt?: string | null;
+  archivedAt?: string | null;
+  deletedAt?: string | null;
+  updatedAt?: string;
+};
+
+function normalizeUsers(users: User[]): User[] {
+  return users.map((user) => normalizeUser(user));
+}
+
+function mergeUser(user: User, patch: UserPatch): User {
+  return normalizeUser({
+    ...user,
+    ...patch,
+    updatedAt: patch.updatedAt || now(),
+  });
+}
+
+function userStatusReason(status: UserStatus): string {
+  switch (status) {
+    case 'Suspended':
+      return 'Admin suspended';
+    case 'Locked':
+      return 'Too many failed login attempts';
+    case 'Archived':
+      return 'Archived by admin';
+    case 'Disabled':
+      return 'Account disabled';
+    case 'Pending':
+      return 'Pending activation';
+    case 'Inactive':
+      return 'Inactive';
+    default:
+      return 'Active';
+  }
+}
 
 // ─── Store Shape ──────────────────────────────────────────────
 
@@ -31,12 +105,26 @@ export interface AppState {
   auditLogs: AuditLog[];
 
   // Auth actions
-  login: (username: string, password: string) => User | null;
+  login: (username: string, password: string) => LoginResult;
   logout: () => void;
 
   // User management
   addUser: (user: User) => void;
   updateUser: (user: User) => void;
+  suspendUser: (userId: string, reason?: string) => void;
+  activateUser: (userId: string) => void;
+  lockUser: (userId: string, reason?: string) => void;
+  unlockUser: (userId: string) => void;
+  resetPassword: (userId: string, password?: string) => string | null;
+  deleteUser: (userId: string) => void;
+  archiveUser: (userId: string, reason?: string) => void;
+  bulkUpdateUsers: (userIds: string[], patch: UserPatch, action?: ActionType, comment?: string) => void;
+  incrementFailedAttempts: (userId: string) => User | null;
+  clearFailedAttempts: (userId: string) => void;
+  forceLogoutUser: (userId: string) => void;
+  impersonateUser: (userId: string) => boolean;
+  getUserPassword: (userId: string) => string | null;
+  generateTemporaryPassword: () => string;
 
   // Batch actions
   createBatch: (data: {
@@ -77,7 +165,10 @@ export interface AppState {
     field?: string,
     prev?: string,
     next?: string,
-    comment?: string
+    comment?: string,
+    reason?: string,
+    ipAddress?: string,
+    deviceInfo?: string
   ) => void;
 
   // Helpers
@@ -98,7 +189,7 @@ export const useAppStore = create<AppState>()(
     (set, get) => ({
       // ── Initial state ──────────────────────────────────────
       currentUser: null,
-      users: SEED_USERS,
+      users: normalizeUsers(SEED_USERS),
       batches: SEED_BATCHES,
       batchDocuments: SEED_BATCH_DOCUMENTS,
       awsTestSections: SEED_AWS_SECTIONS,
@@ -106,17 +197,49 @@ export const useAppStore = create<AppState>()(
 
       // ── Auth ───────────────────────────────────────────────
       login: (username, password) => {
-        const user = get().users.find(
-          (u) => u.username === username && u.password === password && u.status === 'Active'
-        );
-        if (!user) return null;
-        const updated = { ...user, lastLogin: now() };
+        const user = get().users.find((candidate) => candidate.username === username);
+        if (!user) {
+          return { user: null, reason: 'INVALID' };
+        }
+
+        if (isPrivilegedStatus(user.status)) {
+          const blockedReason =
+            user.status === 'Suspended'
+              ? 'SUSPENDED'
+              : user.status === 'Locked'
+                ? 'LOCKED'
+                : user.status === 'Archived'
+                  ? 'ARCHIVED'
+                  : 'DISABLED';
+          get().addAudit('FAILED_LOGIN', 'USER', user.id, buildUserAuditRef(user), 'status', user.status, user.status, `Account is ${user.status.toLowerCase()}`);
+          return { user: null, reason: blockedReason };
+        }
+
+        if (user.status === 'Pending' || user.status === 'Inactive') {
+          get().addAudit('FAILED_LOGIN', 'USER', user.id, buildUserAuditRef(user), 'status', user.status, user.status, `Account is ${user.status.toLowerCase()}`);
+          return { user: null, reason: user.status === 'Pending' ? 'PENDING' : 'DISABLED' };
+        }
+
+        if (user.password !== password) {
+          const nextState = get().incrementFailedAttempts(user.id);
+          if (nextState?.status === 'Locked') {
+            return { user: null, reason: 'LOCKED' };
+          }
+          return { user: null, reason: 'INVALID' };
+        }
+
+        const updated = mergeUser(user, {
+          lastLogin: now(),
+          lastActivityAt: now(),
+          failedLoginAttempts: 0,
+          lockedAt: null,
+        });
         set((s) => ({
           currentUser: updated,
           users: s.users.map((u) => (u.id === user.id ? updated : u)),
         }));
         get().addAudit('LOGIN', 'USER', user.id, user.username);
-        return updated;
+        return { user: updated };
       },
 
       logout: () => {
@@ -129,15 +252,290 @@ export const useAppStore = create<AppState>()(
 
       // ── User Management ────────────────────────────────────
       addUser: (user) => {
-        set((s) => ({ users: [...s.users, user] }));
-        get().addAudit('CREATE', 'USER', user.id, user.username);
+        const normalized = normalizeUser({
+          ...user,
+          password: user.password || DEFAULT_PASSWORD,
+          createdAt: user.createdAt || now(),
+          updatedAt: user.updatedAt || now(),
+          passwordUpdatedAt: user.passwordUpdatedAt || now(),
+          failedLoginAttempts: user.failedLoginAttempts ?? 0,
+          lastActivityAt: user.lastActivityAt ?? null,
+          lockedAt: user.lockedAt ?? null,
+          suspendedAt: user.suspendedAt ?? null,
+          archivedAt: user.archivedAt ?? null,
+          deletedAt: user.deletedAt ?? null,
+          statusReason: user.statusReason ?? userStatusReason(user.status),
+          suspendedReason: user.suspendedReason ?? null,
+          forcePasswordChange: user.forcePasswordChange ?? false,
+        });
+        set((s) => ({ users: [...s.users, normalized] }));
+        get().addAudit('CREATE', 'USER', normalized.id, buildUserAuditRef(normalized));
       },
 
       updateUser: (user) => {
+        const existing = get().users.find((candidate) => candidate.id === user.id);
+        const nextUser = normalizeUser({
+          ...(existing || user),
+          ...user,
+          updatedAt: now(),
+        });
         set((s) => ({
-          users: s.users.map((u) => (u.id === user.id ? user : u)),
+          users: s.users.map((u) => (u.id === user.id ? nextUser : u)),
+          currentUser: s.currentUser?.id === user.id ? nextUser : s.currentUser,
+        }));
+        get().addAudit('EDIT_USER', 'USER', nextUser.id, buildUserAuditRef(nextUser));
+      },
+
+      suspendUser: (userId, reason) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Suspended',
+          suspendedAt: now(),
+          suspendedReason: reason || 'Suspended by admin',
+          statusReason: reason || 'Suspended by admin',
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('SUSPEND_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Suspended', reason || 'Suspended by admin');
+      },
+
+      activateUser: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Active',
+          suspendedAt: null,
+          suspendedReason: null,
+          lockedAt: null,
+          failedLoginAttempts: 0,
+          statusReason: 'Active',
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('ACTIVATE_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Active');
+      },
+
+      lockUser: (userId, reason) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Locked',
+          lockedAt: now(),
+          statusReason: reason || 'Locked by admin',
+          failedLoginAttempts: target.failedLoginAttempts || FAILED_LOGIN_LIMIT,
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('LOCK_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Locked', reason || 'Locked by admin');
+      },
+
+      unlockUser: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Active',
+          lockedAt: null,
+          failedLoginAttempts: 0,
+          statusReason: 'Active',
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('UNLOCK_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Active');
+      },
+
+      resetPassword: (userId, password) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !hasPermission(actor.role, 'users:password:reset') || !canManageTargetUser(actor.role, target.role)) return null;
+
+        const nextPassword = password?.trim() || generateTemporaryPassword();
+        const nextUser = resetUserPassword(target, nextPassword);
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('RESET_PASSWORD', 'USER', userId, buildUserAuditRef(nextUser), 'password', 'hidden', 'hidden', 'Password reset by admin');
+        return nextPassword;
+      },
+
+      deleteUser: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Archived',
+          archivedAt: now(),
+          deletedAt: now(),
+          statusReason: 'Archived by admin',
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('DELETE_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Archived', 'Soft deleted by admin');
+      },
+
+      archiveUser: (userId, reason) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          status: 'Archived',
+          archivedAt: now(),
+          statusReason: reason || 'Archived by admin',
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('ARCHIVE_USER', 'USER', userId, buildUserAuditRef(nextUser), 'status', target.status, 'Archived', reason || 'Archived by admin');
+      },
+
+      bulkUpdateUsers: (userIds, patch, action = 'BULK_UPDATE_USERS', comment) => {
+        const actor = get().currentUser;
+        if (!actor) return;
+
+        const users = get().users;
+        const updates = new Set(userIds);
+        const nextUsers = users.map((candidate) => {
+          if (!updates.has(candidate.id)) return candidate;
+          if (!canManageTargetUser(actor.role, candidate.role)) return candidate;
+
+          const nextUser = mergeUser(candidate, {
+            ...patch,
+            statusReason: patch.statusReason ?? candidate.statusReason,
+          });
+
+          get().addAudit(action, 'USER', candidate.id, buildUserAuditRef(nextUser), undefined, candidate.status, nextUser.status, comment || 'Bulk user update');
+          return nextUser;
+        });
+
+        set((s) => ({
+          users: nextUsers,
+          currentUser: s.currentUser && updates.has(s.currentUser.id) ? nextUsers.find((candidate) => candidate.id === s.currentUser?.id) || s.currentUser : s.currentUser,
         }));
       },
+
+      incrementFailedAttempts: (userId) => {
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!target) return null;
+
+        const nextAttempts = (target.failedLoginAttempts || 0) + 1;
+        const locked = nextAttempts >= FAILED_LOGIN_LIMIT;
+        const nextUser = mergeUser(target, {
+          failedLoginAttempts: nextAttempts,
+          lastActivityAt: now(),
+          status: locked ? 'Locked' : target.status,
+          lockedAt: locked ? now() : target.lockedAt || null,
+          statusReason: locked ? 'Too many failed login attempts' : target.statusReason || null,
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('FAILED_LOGIN', 'USER', userId, buildUserAuditRef(nextUser), 'failedLoginAttempts', String(target.failedLoginAttempts || 0), String(nextAttempts), locked ? 'Account locked after threshold' : 'Incorrect password');
+        return nextUser;
+      },
+
+      clearFailedAttempts: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        const nextUser = mergeUser(target, {
+          failedLoginAttempts: 0,
+          lockedAt: null,
+          statusReason: 'Active',
+          status: target.status === 'Locked' ? 'Active' : target.status,
+        });
+
+        set((s) => ({
+          users: s.users.map((candidate) => (candidate.id === userId ? nextUser : candidate)),
+          currentUser: s.currentUser?.id === userId ? nextUser : s.currentUser,
+        }));
+
+        get().addAudit('CLEAR_FAILED_ATTEMPTS', 'USER', userId, buildUserAuditRef(nextUser), 'failedLoginAttempts', String(target.failedLoginAttempts || 0), '0');
+      },
+
+      forceLogoutUser: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return;
+
+        if (get().currentUser?.id === userId) {
+          set({ currentUser: null });
+        }
+
+        get().addAudit('LOGOUT', 'USER', userId, buildUserAuditRef(target), 'session', 'active', 'terminated', 'Force logout issued by admin');
+      },
+
+      impersonateUser: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target || !canManageTargetUser(actor.role, target.role)) return false;
+
+        const updatedTarget = mergeUser(target, {
+          lastActivityAt: now(),
+          updatedAt: now(),
+        });
+
+        set((s) => ({
+          currentUser: updatedTarget,
+          users: s.users.map((candidate) => (candidate.id === userId ? updatedTarget : candidate)),
+        }));
+
+        get().addAudit('LOGIN', 'USER', userId, buildUserAuditRef(updatedTarget), 'session', actor.username, target.username, 'Demo impersonation started');
+        return true;
+      },
+
+      getUserPassword: (userId) => {
+        const actor = get().currentUser;
+        const target = get().users.find((candidate) => candidate.id === userId);
+        if (!actor || !target) return null;
+
+        const password = getUserPassword(target, actor.role);
+        if (!password) return null;
+
+        get().addAudit('VIEW_PASSWORD', 'USER', userId, buildUserAuditRef(target), 'password', 'hidden', 'visible', 'Password revealed in demo admin console');
+        return password;
+      },
+
+      generateTemporaryPassword: () => generateTemporaryPassword(),
 
       // ── Batch Creation ─────────────────────────────────────
       createBatch: (data) => {
@@ -616,7 +1014,7 @@ export const useAppStore = create<AppState>()(
       },
 
       // ── Audit Logging ──────────────────────────────────────
-      addAudit: (action, docType, docId, docRef, field, prev, next, comment) => {
+      addAudit: (action, docType, docId, docRef, field, prev, next, comment, reason, ipAddress, deviceInfo) => {
         const user = get().currentUser;
         const log: AuditLog = {
           id: generateId(),
@@ -633,6 +1031,9 @@ export const useAppStore = create<AppState>()(
           prevValue: prev,
           newValue: next,
           comment,
+          reason: reason || comment,
+          ipAddress: ipAddress || '0.0.0.0',
+          deviceInfo: deviceInfo || 'Demo browser session',
         };
         set((s) => ({ auditLogs: [log, ...s.auditLogs] }));
       },
@@ -664,7 +1065,7 @@ export const useAppStore = create<AppState>()(
       resetDemoData: () => {
         set({
           currentUser: null,
-          users: SEED_USERS,
+          users: normalizeUsers(SEED_USERS),
           batches: SEED_BATCHES,
           batchDocuments: SEED_BATCH_DOCUMENTS,
           awsTestSections: SEED_AWS_SECTIONS,

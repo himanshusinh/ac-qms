@@ -8,6 +8,7 @@
 export type Role = 'SADMIN' | 'QC_EXEC' | 'QC_MGR' | 'QA_EXEC' | 'QA_MGR';
 export type Department = 'QC' | 'QA' | 'SYSTEM';
 export type DocType = 'SPEC' | 'MOA' | 'AWS' | 'COA';
+export type UserStatus = 'Active' | 'Suspended' | 'Locked' | 'Archived' | 'Disabled' | 'Pending' | 'Inactive';
 
 export type DocStatus =
   | 'PENDING'          // placeholder, not yet started
@@ -37,7 +38,20 @@ export type ActionType =
   | 'LOGOUT'
   | 'RESET_PASSWORD'
   | 'SAVE_DRAFT'
-  | 'MARK_COMPLETE';
+  | 'MARK_COMPLETE'
+  | 'VIEW_PASSWORD'
+  | 'CHANGE_ROLE'
+  | 'CHANGE_DEPARTMENT'
+  | 'SUSPEND_USER'
+  | 'ACTIVATE_USER'
+  | 'LOCK_USER'
+  | 'UNLOCK_USER'
+  | 'ARCHIVE_USER'
+  | 'DELETE_USER'
+  | 'BULK_UPDATE_USERS'
+  | 'FAILED_LOGIN'
+  | 'CLEAR_FAILED_ATTEMPTS'
+  | 'EDIT_USER';
 
 export type DocumentType = 'USER' | 'BATCH' | 'SPEC' | 'MOA' | 'AWS' | 'COA' | 'INSTRUMENT' | 'REAGENT';
 
@@ -48,11 +62,24 @@ export interface User {
   name: string;
   username: string;
   email: string;
+  phone?: string;
+  employeeId?: string;
   role: Role;
   department: Department;
-  status: 'Active' | 'Inactive';
+  status: UserStatus;
   lastLogin: string | null;
   password: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastActivityAt?: string | null;
+  passwordUpdatedAt?: string | null;
+  failedLoginAttempts?: number;
+  lockedAt?: string | null;
+  suspendedAt?: string | null;
+  suspendedReason?: string | null;
+  archivedAt?: string | null;
+  deletedAt?: string | null;
+  statusReason?: string | null;
   forcePasswordChange?: boolean;
 }
 
@@ -245,8 +272,13 @@ export interface AuditLog {
   docType: DocumentType;
   docId: string;
   docRef?: string;
+  targetUserId?: string;
+  targetUserName?: string;
   fieldChanged?: string;
   prevValue?: string;
   newValue?: string;
   comment?: string;
+  reason?: string;
+  ipAddress?: string;
+  deviceInfo?: string;
 }
