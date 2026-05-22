@@ -220,7 +220,7 @@ export default function UsersListPage() {
 
   const visibleColumnHeader = (
     <TableHead className="w-10">
-      <Checkbox checked={allVisibleSelected ? true : someVisibleSelected ? "indeterminate" : false} onCheckedChange={(value) => handleSelectAllVisible(Boolean(value))} />
+      <Checkbox checked={allVisibleSelected} onCheckedChange={(value) => handleSelectAllVisible(Boolean(value))} />
     </TableHead>
   );
 
