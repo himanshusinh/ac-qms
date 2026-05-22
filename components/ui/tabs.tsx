@@ -67,24 +67,28 @@ function TabsList({
             if (el && typeof (el as HTMLElement).click === "function") (el as HTMLElement).click()
           }}
         >
-              {React.Children.map(children, (child) => {
-                const childEl = child as React.ReactElement<{ value?: string }>
-                if (!childEl || !childEl.props) return null
-                const val = childEl.props.value ?? String(childEl.key ?? "")
-                const label = typeof childEl.props.children === "string" ? childEl.props.children : (Array.isArray(childEl.props.children) ? childEl.props.children[0] : childEl.props.children)
-                return (
-                  <option key={val} value={val}>
-                    {label ?? val}
-                  </option>
-                )
-              })}
+          {React.Children.map(children, (child) => {
+            const childEl = child as React.ReactElement<{ value?: string; children?: React.ReactNode }>
+            if (!childEl || !childEl.props) return null
+            const val = childEl.props.value ?? String(childEl.key ?? "")
+            const label = typeof childEl.props.children === "string"
+              ? childEl.props.children
+              : Array.isArray(childEl.props.children)
+                ? childEl.props.children[0]
+                : childEl.props.children
+            return (
+              <option key={val} value={val}>
+                {label ?? val}
+              </option>
+            )
+          })}
         </select>
       </div>
     </>
   )
 }
 
-function TabsTrigger({ className, value, ...props }: TabsPrimitive.Tab.Props & { value?: string }) {
+function TabsTrigger({ className, value, ...props }: TabsPrimitive.Tab.Props) {
   return (
     <TabsPrimitive.Tab
       data-slot="tabs-trigger"
