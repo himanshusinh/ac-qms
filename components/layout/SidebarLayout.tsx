@@ -11,6 +11,8 @@ import type { Role } from "@/types";
 
 interface NavItem { label: string; href: string; icon: React.ReactNode; }
 
+type IconElement = React.ReactElement<{ className?: string }>;
+
 function getNavItems(role: Role): NavItem[] {
   switch (role) {
     case "SADMIN":
@@ -99,7 +101,7 @@ export function SidebarLayout({ children }: { children: React.ReactNode }) {
               >
                 <span className="flex-none text-white/90">
                   {React.isValidElement(item.icon)
-                    ? React.cloneElement(item.icon, { className: "w-5 h-5" })
+                    ? React.cloneElement(item.icon as IconElement, { className: "w-5 h-5" })
                     : item.icon}
                 </span>
                 <span className="flex-1 truncate">{item.label}</span>
