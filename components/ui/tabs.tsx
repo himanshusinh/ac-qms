@@ -93,6 +93,7 @@ function TabsTrigger({ className, value, ...props }: TabsPrimitive.Tab.Props) {
     <TabsPrimitive.Tab
       data-slot="tabs-trigger"
       data-value={value}
+      value={value}
       className={cn(
         "relative inline-flex items-center gap-[var(--space-compact)] rounded-full px-[var(--space-section)] py-[6px] text-sm font-medium whitespace-nowrap text-foreground/60 transition-all hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring data-active:bg-primary data-active:text-primary-foreground",
         className
