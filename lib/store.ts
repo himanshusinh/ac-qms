@@ -774,6 +774,10 @@ export const useAppStore = create<AppState>()(
         // QC_EXEC: DRAFT → SUBMITTED
         if (toStatus === 'SUBMITTED' && role !== 'QC_EXEC') return false;
         if (toStatus === 'SUBMITTED' && fromStatus !== 'DRAFT') return false;
+        if (toStatus === 'SUBMITTED' && doc.docType === 'AWS') {
+          const sections = get().awsTestSections.filter((s) => s.batchDocumentId === documentId);
+          if (sections.length === 0 || sections.some((s) => s.status !== 'Completed')) return false;
+        }
 
         // QC_MGR: SUBMITTED → QC_APPROVED, or → REJECTED
         if (toStatus === 'QC_APPROVED' && role !== 'QC_MGR') return false;

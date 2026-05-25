@@ -21,6 +21,21 @@ import {
 } from "lucide-react";
 import type { AwsTestSection, TestParameter, MoaSection } from "@/types";
 
+function getRecommendedInstrumentId(testName: string) {
+  if (testName === "pH") return "inst-ph001";
+  if (testName === "Loss on Drying") return "inst-oven001";
+  if (testName === "Assay") return "inst-hplc001";
+  if (testName === "Description") return "inst-ftir001";
+  return "";
+}
+
+function getRecommendedReagentIds(testName: string) {
+  if (testName === "pH") return ["rgt-buf-ph4", "rgt-buf-ph7"];
+  if (testName === "Solubility") return ["rgt-meoh"];
+  if (testName === "Assay") return ["rgt-mpb", "rgt-rs-gly", "rgt-meoh"];
+  return [];
+}
+
 export default function AwsSectionEntryPage() {
   const params = useParams();
   const router = useRouter();
@@ -45,8 +60,14 @@ export default function AwsSectionEntryPage() {
   const moa: MoaSection | undefined = useMemo(() => (section ? moaTemplate?.sections.find((s) => s.testParameterId === section.testParameterId) : undefined), [section, moaTemplate]);
 
   // Local form state
-  const [instrumentId, setInstrumentId] = useState(section?.instrumentId || "");
-  const [reagentIds, setReagentIds] = useState<string[]>(section?.reagents?.map((r) => r.reagentId) || []);
+  const [instrumentId, setInstrumentId] = useState(section?.instrumentId || (section?.status === "NotStarted" && tp ? getRecommendedInstrumentId(tp.name) : ""));
+  const [reagentIds, setReagentIds] = useState<string[]>(
+    section?.reagents?.length
+      ? section.reagents.map((r) => r.reagentId)
+      : section?.status === "NotStarted" && tp
+        ? getRecommendedReagentIds(tp.name)
+        : []
+  );
   const [observations, setObservations] = useState(section?.observations || "");
   const [inputs, setInputs] = useState<Record<string, string>>(section?.inputs || {});
   const [conclusion, setConclusion] = useState(section?.conclusion || "");
@@ -118,6 +139,44 @@ export default function AwsSectionEntryPage() {
 
   const isOutsideLab = tp && !tp.mandatory && tp.name === "Heavy Metals";
 
+  const applyPrototypeResult = useCallback(() => {
+    if (!tp) return;
+
+    if (tp.resultType === "Qualitative") {
+      setObservations(tp.acceptanceCriteria || moa?.conclusionTemplate || "Complies as per specification");
+      setConclusion("Satisfactory");
+      return;
+    }
+
+    if (tp.name === "pH") {
+      setInputs((prev) => ({ ...prev, pH: "6.20" }));
+      return;
+    }
+
+    if (tp.name === "Loss on Drying") {
+      setInputs((prev) => ({ ...prev, W1: "1.000", W2: "0.998" }));
+      return;
+    }
+
+    if (tp.name === "Assay") {
+      setInputs((prev) => ({
+        ...prev,
+        A_sample: "1000",
+        A_standard: "1000",
+        W_standard: "0.200",
+        W_sample: "0.200",
+        Purity: "99.8",
+      }));
+      return;
+    }
+
+    if (tp.name === "Heavy Metals") {
+      setInputs((prev) => ({ ...prev, result: "2.0" }));
+      setOutsideLabRef((prev) => prev || `OL-${batch?.batchNo || "BATCH"}-HM`);
+      setOutsideLabDate((prev) => prev || new Date().toISOString().slice(0, 10));
+    }
+  }, [tp, moa, batch]);
+
   const buildSection = useCallback((): AwsTestSection => {
     return {
       ...section!,
@@ -152,11 +211,14 @@ export default function AwsSectionEntryPage() {
   const handleMarkComplete = () => {
     if (!section || !tp) return;
     // Validate
+    if (tp.resultType === "Quantitative" && !instrumentId) { toast.error("Select the instrument used"); return; }
     if (tp.resultType === "Quantitative" && !calculatedResult) { toast.error("Enter all formula inputs to calculate result"); return; }
     if (tp.resultType === "Qualitative" && !observations) { toast.error("Enter observations"); return; }
     if (tp.resultType === "Qualitative" && !conclusion) { toast.error("Select a conclusion"); return; }
     if (isOOS && !oosAcknowledged) { toast.error("You must acknowledge the OOS result"); return; }
     if (instrumentExpired && !expiredInstrAck) { toast.error("Acknowledge expired instrument"); return; }
+    if (expiredReagents.length > 0 && !expiredReagentAck) { toast.error("Acknowledge expired reagent(s)"); return; }
+    if (isOutsideLab && (!outsideLabRef || !outsideLabDate)) { toast.error("Enter outside laboratory report details"); return; }
 
     const updated = buildSection();
     updated.status = "Completed";
@@ -298,7 +360,12 @@ export default function AwsSectionEntryPage() {
 
             {/* C. Observations / Results */}
             <Card>
-              <CardHeader className="pb-3"><CardTitle className="text-sm flex items-center gap-2"><FileText className="w-4 h-4" /> C. Test Observations</CardTitle></CardHeader>
+              <CardHeader className="pb-3 flex flex-row items-center justify-between gap-3">
+                <CardTitle className="text-sm flex items-center gap-2"><FileText className="w-4 h-4" /> C. Test Observations</CardTitle>
+                <Button type="button" size="sm" variant="outline" onClick={applyPrototypeResult}>
+                  <CheckCircle2 className="w-4 h-4 mr-2" /> Use Expected Result
+                </Button>
+              </CardHeader>
               <CardContent className="space-y-4">
                 {tp.resultType === "Qualitative" ? (
                   <>
